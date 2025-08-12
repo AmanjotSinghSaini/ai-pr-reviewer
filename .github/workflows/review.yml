@@ -12,12 +12,16 @@ on:
         description: 'AI model to use for code review'
         required: false
         type: string
-        default: 'gpt-4o-mini'
+        default: 'llama3-8b-8192'
       exclude_paths:
         description: 'Comma-separated paths to exclude from AI review'
         required: false
         type: string
         default: '*.md,*.txt,*.json,package-lock.json,yarn.lock'
+    secrets:
+      GROQ_API_KEY:
+        description: 'Groq API Key for AI code review'
+        required: true
 
 jobs:
   ai-code-review:
@@ -201,13 +205,12 @@ jobs:
           # Append the code content
           cat code_for_review.txt >> review_prompt.txt
           
-          # Call GitHub Models API
-          echo "Making API request to GitHub Models..."
+          # Call Groq API (free and reliable)
+          echo "Making API request to Groq..."
           
           response=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer ${{ secrets.GROQ_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -H "User-Agent: GitHubActions/1.0" \
             -d "$(jq -n \
               --arg model "${{ inputs.ai_model }}" \
               --arg content "$(cat review_prompt.txt)" \
@@ -222,7 +225,7 @@ jobs:
                 "max_tokens": 2000,
                 "temperature": 0.3
               }')" \
-            "https://models.inference.ai.azure.com/chat/completions")
+            "https://api.groq.com/openai/v1/chat/completions")
           
           # Split response and status code
           http_code=$(echo "$response" | tail -n1)
