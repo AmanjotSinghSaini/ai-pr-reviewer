@@ -1,0 +1,259 @@
+name: 'AI Code Reviewer'
+
+on:
+  workflow_call:
+    inputs:
+      enable_gitleaks:
+        description: 'Enable Gitleaks secrets scanning'
+        required: false
+        type: boolean
+        default: true
+      ai_model:
+        description: 'AI model to use for code review'
+        required: false
+        type: string
+        default: 'gpt-4o-mini'
+      exclude_paths:
+        description: 'Comma-separated paths to exclude from AI review'
+        required: false
+        type: string
+        default: '*.md,*.txt,*.json,package-lock.json,yarn.lock'
+
+jobs:
+  ai-code-review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Get changed files
+        id: changed-files
+        run: |
+          # Get list of changed files
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed_files.txt
+          
+          # Filter out excluded paths
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "${{ inputs.exclude_paths }}"
+          
+          filtered_files=""
+          while IFS= read -r file; do
+            exclude_file=false
+            for pattern in "${EXCLUDE_ARRAY[@]}"; do
+              pattern=$(echo "$pattern" | xargs) # trim whitespace
+              if [[ "$file" == $pattern ]]; then
+                exclude_file=true
+                break
+              fi
+            done
+            
+            if [[ "$exclude_file" == false && -f "$file" ]]; then
+              filtered_files="$filtered_files$file"$'\n'
+            fi
+          done < changed_files.txt
+          
+          echo "$filtered_files" > filtered_changed_files.txt
+          
+          if [[ -s filtered_changed_files.txt ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Run Gitleaks
+        if: inputs.enable_gitleaks == true
+        id: gitleaks
+        run: |
+          # Install Gitleaks
+          wget https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.18.4_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.4_linux_x64.tar.gz
+          chmod +x gitleaks
+          
+          # Run Gitleaks on changed files only
+          gitleaks_output=""
+          if [[ -s filtered_changed_files.txt ]]; then
+            while IFS= read -r file; do
+              if [[ -f "$file" ]]; then
+                result=$(./gitleaks detect --source "$file" --no-git --verbose 2>&1 || true)
+                if [[ "$result" == *"leaks found"* ]]; then
+                  gitleaks_output="$gitleaks_output\n### 🚨 Secrets found in: \`$file\`\n\`\`\`\n$result\n\`\`\`\n"
+                fi
+              fi
+            done < filtered_changed_files.txt
+          fi
+          
+          if [[ -n "$gitleaks_output" ]]; then
+            echo "secrets_found=true" >> $GITHUB_OUTPUT
+            # Save output to file for later use
+            echo -e "$gitleaks_output" > gitleaks_results.txt
+          else
+            echo "secrets_found=false" >> $GITHUB_OUTPUT
+            echo "✅ No secrets detected in changed files." > gitleaks_results.txt
+          fi
+
+      - name: Prepare code for AI review
+        if: steps.changed-files.outputs.has_changes == 'true'
+        id: prepare-code
+        run: |
+          review_content=""
+          file_count=0
+          total_lines=0
+          
+          while IFS= read -r file; do
+            if [[ -f "$file" && -s "$file" ]]; then
+              file_size=$(wc -l < "$file")
+              
+              # Skip very large files (>500 lines) to avoid token limits
+              if [[ $file_size -gt 500 ]]; then
+                review_content="$review_content\n\n### 📄 $file (${file_size} lines - truncated for review)\n"
+                review_content="$review_content\`\`\`\n$(head -n 100 "$file")\n... [file truncated - showing first 100 lines only] ...\n\`\`\`"
+              else
+                review_content="$review_content\n\n### 📄 $file (${file_size} lines)\n"
+                review_content="$review_content\`\`\`\n$(cat "$file")\n\`\`\`"
+              fi
+              
+              file_count=$((file_count + 1))
+              total_lines=$((total_lines + file_size))
+              
+              # Limit total content to prevent API limits
+              if [[ $file_count -ge 10 || $total_lines -ge 2000 ]]; then
+                review_content="$review_content\n\n*Note: Review limited to first $file_count files to stay within API limits.*"
+                break
+              fi
+            fi
+          done < filtered_changed_files.txt
+          
+          # Save to file
+          echo -e "$review_content" > code_for_review.txt
+          
+          echo "file_count=$file_count" >> $GITHUB_OUTPUT
+          echo "total_lines=$total_lines" >> $GITHUB_OUTPUT
+
+      - name: AI Code Review
+        if: steps.changed-files.outputs.has_changes == 'true'
+        id: ai-review
+        run: |
+          # Prepare the prompt
+          cat << 'EOF' > review_prompt.txt
+          You are an expert code reviewer. Please review the following code changes and provide detailed feedback.
+
+          Focus on:
+          1. **Code Quality**: Logic issues, potential bugs, error handling
+          2. **Security**: Vulnerabilities, unsafe practices, input validation
+          3. **Performance**: Inefficient algorithms, resource usage, optimization opportunities  
+          4. **Best Practices**: Coding standards, design patterns, maintainability
+          5. **Documentation**: Missing comments, unclear variable names
+          
+          Please provide your feedback in the following format:
+          
+          ## 🤖 AI Code Review Summary
+          
+          ### ✅ Positive Findings
+          - List good practices found in the code
+          
+          ### ⚠️ Issues & Suggestions
+          - **[Severity: High/Medium/Low]** Issue description
+            - Suggestion for improvement
+            - Code example if applicable
+          
+          ### 🔧 Recommendations
+          - General recommendations for the codebase
+          
+          Be constructive and specific. If the code looks good overall, mention that too.
+          
+          ---
+          
+          Code to review:
+          EOF
+          
+          # Append code content
+          cat code_for_review.txt >> review_prompt.txt
+          
+          # Make API call to GitHub Models
+          response=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"${{ inputs.ai_model }}\",
+              \"messages\": [
+                {
+                  \"role\": \"user\",
+                  \"content\": \"$(cat review_prompt.txt | jq -Rs .)\"
+                }
+              ],
+              \"max_tokens\": 2000,
+              \"temperature\": 0.3
+            }" \
+            "https://models.inference.ai.azure.com/chat/completions")
+          
+          # Extract the AI response
+          ai_feedback=$(echo "$response" | jq -r '.choices[0].message.content // "AI review service temporarily unavailable. Please review the code manually."')
+          
+          # Save AI feedback
+          echo "$ai_feedback" > ai_review_results.txt
+          
+          echo "review_completed=true" >> $GITHUB_OUTPUT
+
+      - name: Post Review Comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            
+            let comment = '# 🤖 AI Code Reviewer Results\n\n';
+            
+            // Add timestamp
+            comment += `*Review completed at: ${new Date().toLocaleString()}*\n\n`;
+            
+            // Add Gitleaks results
+            if (${{ inputs.enable_gitleaks }}) {
+              comment += '## 🔐 Security Scan (Gitleaks)\n\n';
+              try {
+                const gitleaksResults = fs.readFileSync('gitleaks_results.txt', 'utf8');
+                comment += gitleaksResults + '\n\n';
+              } catch (error) {
+                comment += '⚠️ Gitleaks scan could not be completed.\n\n';
+              }
+            }
+            
+            // Add AI review results
+            if ('${{ steps.changed-files.outputs.has_changes }}' === 'true') {
+              try {
+                const aiResults = fs.readFileSync('ai_review_results.txt', 'utf8');
+                comment += aiResults + '\n\n';
+              } catch (error) {
+                comment += '⚠️ AI code review could not be completed.\n\n';
+              }
+              
+              comment += '---\n';
+              comment += `📊 **Review Stats**: ${{ steps.prepare-code.outputs.file_count }} files reviewed, ${{ steps.prepare-code.outputs.total_lines }} total lines\n\n`;
+            } else {
+              comment += '## 📝 Code Review\n\n';
+              comment += 'ℹ️ No reviewable code changes detected in this PR.\n\n';
+            }
+            
+            comment += '*This is an automated review. Please use human judgment for final decisions.*';
+            
+            // Post comment
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f changed_files.txt filtered_changed_files.txt code_for_review.txt
+          rm -f review_prompt.txt ai_review_results.txt gitleaks_results.txt
+          rm -f gitleaks_8.18.4_linux_x64.tar.gz gitleaks
