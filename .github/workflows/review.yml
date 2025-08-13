@@ -12,15 +12,15 @@ on:
         description: 'AI model to use for code review'
         required: false
         type: string
-        default: 'llama3-8b-8192'
+        default: 'gpt-4o-mini'
       exclude_paths:
         description: 'Comma-separated paths to exclude from AI review'
         required: false
         type: string
         default: '*.md,*.txt,*.json,package-lock.json,yarn.lock'
     secrets:
-      GROQ_API_KEY:
-        description: 'Groq API Key for AI code review'
+      AI_GITHUB_TOKEN:
+        description: 'GitHub Personal Access Token with models:read permission'
         required: true
 
 jobs:
@@ -166,7 +166,7 @@ jobs:
         if: steps.changed-files.outputs.has_changes == 'true'
         id: ai-review
         run: |
-          echo "Starting AI code review..."
+          echo "Starting AI code review using GitHub Models..."
           
           # Create the review prompt
           cat << 'EOF' > review_prompt.txt
@@ -205,11 +205,10 @@ jobs:
           # Append the code content
           cat code_for_review.txt >> review_prompt.txt
           
-          # Call Groq API (free and reliable)
-          echo "Making API request to Groq..."
+          echo "Making API request to GitHub Models..."
           
           response=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: Bearer ${{ secrets.GROQ_API_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.AI_GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
               --arg model "${{ inputs.ai_model }}" \
@@ -225,7 +224,7 @@ jobs:
                 "max_tokens": 2000,
                 "temperature": 0.3
               }')" \
-            "https://api.groq.com/openai/v1/chat/completions")
+            "https://models.inference.ai.azure.com/chat/completions")
           
           # Split response and status code
           http_code=$(echo "$response" | tail -n1)
@@ -248,7 +247,7 @@ jobs:
           else
             echo "API Error - Status: $http_code"
             echo "$response_body"
-            echo "## 🤖 AI Code Review\n\n⚠️ AI review service is temporarily unavailable (HTTP $http_code). Please review the code changes manually.\n\nThe changes are ready for human review." > ai_review_results.txt
+            echo "## 🤖 AI Code Review\n\n⚠️ AI review service returned error (HTTP $http_code). Please review the code changes manually.\n\nThe changes are ready for human review." > ai_review_results.txt
             echo "review_completed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -295,7 +294,7 @@ jobs:
             }
             
             comment += '---\n';
-            comment += '*This is an automated review. Human oversight is recommended for production deployments.*';
+            comment += '*This is an automated review powered by GitHub Models. Human oversight is recommended for production deployments.*';
             
             // Post the comment
             try {
