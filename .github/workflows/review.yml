@@ -3,11 +3,6 @@ name: 'AI Code Reviewer'
 on:
   workflow_call:
     inputs:
-      enable_gitleaks:
-        description: 'Enable Gitleaks secrets scanning'
-        required: false
-        type: boolean
-        default: true
       ai_model:
         description: 'AI model to use for code review'
         required: false
@@ -18,6 +13,16 @@ on:
         required: false
         type: string
         default: '*.md,*.txt,*.json,package-lock.json,yarn.lock'
+      max_file_lines:
+        description: 'Maximum lines to include from each file (0 for no limit)'
+        required: false
+        type: number
+        default: 1000
+      max_files:
+        description: 'Maximum number of files to review'
+        required: false
+        type: number
+        default: 20
     secrets:
       AI_GITHUB_TOKEN:
         description: 'GitHub Personal Access Token with models:read permission'
@@ -81,44 +86,6 @@ jobs:
           else
             echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
-          
-      - name: Run Gitleaks Security Scan
-        if: inputs.enable_gitleaks == true
-        id: gitleaks
-        run: |
-          echo "Running Gitleaks security scan..."
-          
-          gitleaks_output=""
-          secrets_found=false
-          
-          if [[ -s filtered_changed_files.txt ]]; then
-            while IFS= read -r file; do
-              if [[ -n "$file" && -f "$file" ]]; then
-                echo "Scanning file: $file"
-                
-                # Run gitleaks on individual file using docker
-                result=$(docker run --rm -v "${PWD}:/workspace" zricethezav/gitleaks:latest detect \
-                  --source "/workspace/$file" \
-                  --no-git \
-                  --verbose \
-                  --exit-code 1 2>&1 || true)
-                
-                # Check if secrets were found
-                if echo "$result" | grep -q -E "(Finding:|Secret|detected|found)" && ! echo "$result" | grep -q "no leaks found"; then
-                  secrets_found=true
-                  gitleaks_output="$gitleaks_output\n### 🚨 Security Alert - Potential secrets in: \`$file\`\n\`\`\`\n$result\n\`\`\`\n"
-                fi
-              fi
-            done < filtered_changed_files.txt
-          fi
-          
-          if [[ "$secrets_found" == true ]]; then
-            echo "secrets_found=true" >> $GITHUB_OUTPUT
-            echo -e "$gitleaks_output" > gitleaks_results.txt
-          else
-            echo "secrets_found=false" >> $GITHUB_OUTPUT
-            echo "✅ No secrets detected in changed files." > gitleaks_results.txt
-          fi
 
       - name: Prepare code for AI review
         if: steps.changed-files.outputs.has_changes == 'true'
@@ -129,6 +96,8 @@ jobs:
           review_content=""
           file_count=0
           total_lines=0
+          max_files=${{ inputs.max_files }}
+          max_lines=${{ inputs.max_file_lines }}
           
           while IFS= read -r file; do
             if [[ -n "$file" && -f "$file" && -s "$file" ]]; then
@@ -136,20 +105,29 @@ jobs:
               
               echo "Processing file: $file ($file_size lines)"
               
-              # Skip very large files to avoid token limits
-              if [[ $file_size -gt 500 ]]; then
-                review_content="$review_content\n\n### 📄 File: \`$file\` ($file_size lines - showing first 100 lines)\n\`\`\`\n$(head -n 100 "$file")\n... [File truncated for review] ...\n\`\`\`"
+              file_extension="${file##*.}"
+              
+              # Handle large files based on max_lines setting
+              if [[ $max_lines -gt 0 && $file_size -gt $max_lines ]]; then
+                echo "File is large ($file_size lines), truncating to first $max_lines lines"
+                review_content="$review_content\n\n### 📄 File: \`$file\` ($file_size lines - showing first $max_lines lines)\n\`\`\`$file_extension\n$(head -n $max_lines "$file")\n... [File truncated for review - original file has $file_size lines] ...\n\`\`\`"
+              elif [[ $max_lines -eq 0 ]]; then
+                echo "Including full file content ($file_size lines)"
+                review_content="$review_content\n\n### 📄 File: \`$file\` ($file_size lines)\n\`\`\`$file_extension\n$(cat "$file")\n\`\`\`"
               else
-                file_extension="${file##*.}"
                 review_content="$review_content\n\n### 📄 File: \`$file\` ($file_size lines)\n\`\`\`$file_extension\n$(cat "$file")\n\`\`\`"
               fi
               
               file_count=$((file_count + 1))
               total_lines=$((total_lines + file_size))
               
-              # Prevent overwhelming the AI with too much content
-              if [[ $file_count -ge 15 || $total_lines -ge 3000 ]]; then
-                review_content="$review_content\n\n*Note: Review limited to first $file_count files ($total_lines lines total) to stay within API limits.*"
+              # Stop if we reach max files limit
+              if [[ $file_count -ge $max_files ]]; then
+                remaining_files=$(wc -l < filtered_changed_files.txt)
+                remaining_files=$((remaining_files - file_count))
+                if [[ $remaining_files -gt 0 ]]; then
+                  review_content="$review_content\n\n*Note: Review limited to first $file_count files. $remaining_files additional files were not included to stay within limits.*"
+                fi
                 break
               fi
             fi
@@ -262,17 +240,6 @@ jobs:
             let comment = '# 🤖 Automated Code Review Report\n\n';
             comment += `*Generated on: ${new Date().toLocaleString('en-US', {timeZone: 'UTC'})} UTC*\n\n`;
             
-            // Add security scan results
-            if (${{ inputs.enable_gitleaks }}) {
-              comment += '## 🔐 Security Scan Results\n\n';
-              try {
-                const gitleaksResults = fs.readFileSync('gitleaks_results.txt', 'utf8');
-                comment += gitleaksResults + '\n\n';
-              } catch (error) {
-                comment += '⚠️ Security scan could not be completed.\n\n';
-              }
-            }
-            
             // Add AI review results
             if ('${{ steps.changed-files.outputs.has_changes }}' === 'true') {
               try {
@@ -287,7 +254,8 @@ jobs:
               comment += `- **Files Reviewed**: ${{ steps.prepare-code.outputs.file_count || 0 }}\n`;
               comment += `- **Lines of Code**: ${{ steps.prepare-code.outputs.total_lines || 0 }}\n`;
               comment += `- **AI Model Used**: ${{ inputs.ai_model }}\n`;
-              comment += `- **Security Scan**: ${{ inputs.enable_gitleaks && 'Enabled' || 'Disabled' }}\n\n`;
+              comment += `- **Max Lines Per File**: ${{ inputs.max_file_lines }}\n`;
+              comment += `- **Max Files**: ${{ inputs.max_files }}\n\n`;
             } else {
               comment += '## 📝 Code Review Status\n\n';
               comment += 'ℹ️ No reviewable code changes detected in this pull request.\n\n';
@@ -315,5 +283,5 @@ jobs:
         run: |
           echo "Cleaning up temporary files..."
           rm -f changed_files.txt filtered_changed_files.txt code_for_review.txt
-          rm -f review_prompt.txt ai_review_results.txt gitleaks_results.txt
+          rm -f review_prompt.txt ai_review_results.txt
           echo "Cleanup completed"
