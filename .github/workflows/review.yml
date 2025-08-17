@@ -160,7 +160,7 @@ jobs:
           **Response Format:**
           Please structure your response exactly like this:
 
-          ## 🤖 AI Code Review
+          ## AI Code Review
 
           ### ✅ What's Working Well
           - [List positive aspects of the code]
@@ -219,13 +219,13 @@ jobs:
               echo "review_completed=true" >> $GITHUB_OUTPUT
               echo "AI review completed successfully"
             else
-              echo "## 🤖 AI Code Review\n\n⚠️ AI review completed but no content was returned. Please review the changes manually." > ai_review_results.txt
+              echo "## AI Code Review\n\n⚠️ AI review completed but no content was returned. Please review the changes manually." > ai_review_results.txt
               echo "review_completed=partial" >> $GITHUB_OUTPUT
             fi
           else
             echo "API Error - Status: $http_code"
             echo "$response_body"
-            echo "## 🤖 AI Code Review\n\n⚠️ AI review service returned error (HTTP $http_code). Please review the code changes manually.\n\nThe changes are ready for human review." > ai_review_results.txt
+            echo "## AI Code Review\n\n⚠️ AI review service returned error (HTTP $http_code). Please review the code changes manually.\n\nThe changes are ready for human review." > ai_review_results.txt
             echo "review_completed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -237,7 +237,7 @@ jobs:
           script: |
             const fs = require('fs');
             
-            let comment = '# 🤖 Automated Code Review Report\n\n';
+            let comment = '# Automated Code Review Report\n\n';
             comment += `*Generated on: ${new Date().toLocaleString('en-US', {timeZone: 'UTC'})} UTC*\n\n`;
             
             // Add AI review results
@@ -246,7 +246,7 @@ jobs:
                 const aiResults = fs.readFileSync('ai_review_results.txt', 'utf8');
                 comment += aiResults + '\n\n';
               } catch (error) {
-                comment += '## 🤖 AI Code Review\n\n⚠️ AI code review could not be completed.\n\n';
+                comment += '## AI Code Review\n\n⚠️ AI code review could not be completed.\n\n';
               }
               
               comment += '---\n\n';
